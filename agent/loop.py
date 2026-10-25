@@ -1,16 +1,15 @@
-# agent/loop.py
-import json
+﻿import json
 import logging
 import re
-from agent.browser import BrowserAgent
 from agent import tools
 from agent import memory
+from agent.providers.chatgpt import ChatGPTProvider
+from agent.providers.deepseek import DeepSeekProvider
+from agent.browser_manager import BrowserManager
 
 log = logging.getLogger("loop")
 
-SYSTEM_PROMPT = """Ты — автономный ИИ-агент, работающий в строгом цикле. 
-Ты НЕ МОЖЕШЬ выполнять действия напрямую. Ты можешь только ВЫЗЫВАТЬ ИНСТРУМЕНТЫ.
-Твои слова не имеют силы, пока ты не вызовешь инструмент.
+SYSTEM_PROMPT = """Ты — автономный ИИ-агент. Ты управляешь файлами и командами через инструменты.
 
 ДОСТУПНЫЕ ИНСТРУМЕНТЫ:
 1. read_file(path: str)
@@ -19,38 +18,61 @@ SYSTEM_PROMPT = """Ты — автономный ИИ-агент, работаю
 4. run(cmd: str)
 5. done(summary: str)
 
-ПРАВИЛА:
-1. Ты должен отвечать ТОЛЬКО валидным JSON-объектом, без markdown и лишнего текста.
-2. Формат ответа: {"tool": "имя_инструмента", "args": {"arg1": "val1"}}
-3. НЕ ВРИ, что ты что-то сделал. Если нужно создать файл — вызывай write_file. Если нужно запустить тесты — вызывай run.
-4. Вызвать done можно ТОЛЬКО после того, как ты реально выполнил нужные действия через инструменты.
+ВАЖНО:
+- НЕ используй Markdown-обертки (```) внутри JSON. Просто пиши код как строку с \n (перенос строки) и пробелами.
+- Пример правильного ответа: {"tool": "write_file", "args": {"path": "calc.py", "content": "def foo():\n    return 1\n"}}
+- НЕ ИСПОЛЬЗУЙ python -c "...". Только "pytest" или "python file.py".
+- Вызвать done можно ТОЛЬКО когда тесты прошли (exit_code=0).
 """
 
 class AgentLoop:
-    def __init__(self):
-        self.agent = BrowserAgent()
+    def __init__(self, provider=None):
+        self.provider = provider if provider else ChatGPTProvider()
+        self.fallback_provider = None
         self.history = []
+        self.last_action = None
 
     def _parse_json(self, text: str) -> dict:
+        # 1. Ищем ```json ... ```
         match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-        if match:
-            text = match.group(1)
+        if match: text = match.group(1)
         else:
+            # 2. Ищем просто {...}
             start = text.find('{')
             end = text.rfind('}')
-            if start != -1 and end != -1 and end > start:
+            if start != -1 and end != -1:
                 text = text[start:end+1]
+        
         try:
             return json.loads(text)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Не удалось распарсить JSON: {e}\nТекст ответа: {text}")
+        except json.JSONDecodeError:
+            # 3. Пытаемся экранировать все кавычки и распарсить
+            log.warning("Пытаюсь экранировать JSON...")
+            try:
+                # Находим content и экранируем внутренние кавычки
+                fixed = re.sub(r'(?<!\\)"', '\\"', text)
+                fixed = fixed.replace('\\"tool\\"', '"tool"').replace('\\"args\\"', '"args"')
+                return json.loads(fixed)
+            except Exception as e:
+                raise ValueError(f"Не удалось распарсить JSON: {e}\nТекст: {text}")
+
+    def _switch_provider(self):
+        if isinstance(self.provider, DeepSeekProvider):
+            return False
+        log.warning("Переключаюсь на DeepSeek...")
+        try:
+            self.fallback_provider = DeepSeekProvider()
+            self.provider = self.fallback_provider
+            return True
+        except Exception as e:
+            log.error(f"Ошибка переключения: {e}")
+            return False
 
     def execute(self, task: str, max_steps: int = 15) -> str:
         log.info(f"=== НАЧАЛО ЗАДАЧИ: {task.strip()} ===")
         
-        # 1. Читаем память о прошлых задачах
         past_context = memory.load_context()
-        context_block = f"КОНТЕКСТ ПРЕДЫДУЩИХ ЗАДАЧ:\n{past_context}\n" if past_context else ""
+        context_block = f"КОНТЕКСТ:\n{past_context}\n" if past_context else ""
 
         prompt = f"{SYSTEM_PROMPT}\n\n{context_block}\nЗАДАЧА: {task}\n\nВызови первый инструмент."
         self.history = [prompt]
@@ -61,33 +83,45 @@ class AgentLoop:
         for step in range(1, max_steps + 1):
             log.info(f"--- Шаг {step} ---")
             
+            if self.provider.check_limit():
+                log.warning("Лимит!")
+                if not self._switch_provider(): break
+                self.provider.start_new_chat()
+                self.provider.send(f"Продолжаем (шаг {step}).")
+
             try:
-                response_text = self.agent.ask("\n".join(self.history))
+                self.provider.send("\n".join(self.history))
+                response_text = self.provider.wait_answer()
                 action = self._parse_json(response_text)
                 tool_name = action.get("tool")
                 args = action.get("args", {})
             except Exception as e:
-                log.error(f"Ошибка парсинга/запроса: {e}")
-                self.history.append(f"Ошибка: {e}. Ответь ТОЛЬКО валидным JSON.")
+                log.error(f"Ошибка: {e}")
+                self.history.append(f"Ошибка: {e}. Ответь ТОЛЬКО JSON без Markdown.")
                 continue
+
+            current_action_str = json.dumps(action, sort_keys=True)
+            if self.last_action == current_action_str:
+                log.warning("Повтор!")
+                self.history.append("Ошибка: ты повторяешь действие. Сделай что-то другое.")
+                self.last_action = None
+                continue
+            self.last_action = current_action_str
 
             log.info(f"Агент выбрал: {tool_name} {args}")
 
-            # Защита от вранья
             if tool_name == "done":
-                if files_written == 0 and ("напиши" in task.lower() or "создай" in task.lower()):
-                    log.warning("Агент пытается вызвать done, но не создал ни одного файла! Отклоняем.")
-                    self.history.append("Ошибка: ты пытаешься завершить задачу, но не создал ни одного файла через write_file.")
+                if files_written == 0:
+                    self.history.append("Ты не создал файлов!")
                     continue
-                if commands_run == 0 and "тест" in task.lower():
-                    log.warning("Агент пытается вызвать done, но не запустил ни одной команды! Отклоняем.")
-                    self.history.append("Ошибка: ты пытаешься завершить задачу, но не запустил тесты через run.")
+                if commands_run == 0:
+                    self.history.append("Ты не запустил тесты!")
                     continue
                 
-                summary = args.get("summary", "Задача выполнена.")
-                log.info(f"=== ЗАДАЧА ЗАВЕРШЕНА: {summary} ===")
-                memory.save_context(summary) # 2. Сохраняем финальный результат в память
-                self.agent.close()
+                summary = args.get("summary", "Готово.")
+                log.info(f"=== ЗАВЕРШЕНО: {summary} ===")
+                memory.save_context(summary)
+                BrowserManager().close()
                 return summary
 
             elif hasattr(tools, tool_name):
@@ -101,18 +135,19 @@ class AgentLoop:
                     if tool_name == "write_file": files_written += 1
                     if tool_name == "run": commands_run += 1
 
-                # 3. Записываем шаг в файл steps.jsonl
                 memory.log_step(step, tool_name, args, result)
-
                 result_str = json.dumps(result, ensure_ascii=False)
                 log.info(f"Результат: {result_str[:150]}...")
-                self.history.append(f"Вызов: {json.dumps(action, ensure_ascii=False)}")
-                self.history.append(f"Результат: {result_str}")
-                self.history.append("Что делаем дальше?")
+                
+                if tool_name == "run" and not result.get("ok"):
+                    self.history.append(f"Результат (ОШИБКА): {result_str}")
+                    self.history.append("Тесты упали! Исправь код.")
+                else:
+                    self.history.append(f"Результат: {result_str}")
+                    self.history.append("Что дальше?")
             else:
-                log.warning(f"Неизвестный инструмент: {tool_name}")
-                self.history.append(f"Ошибка: инструмента '{tool_name}' не существует.")
+                self.history.append(f"Нет инструмента '{tool_name}'.")
 
-        log.warning(f"=== ЛИМИТ ШАГОВ ({max_steps}) ===")
-        self.agent.close()
-        return "Задача не была завершена."
+        log.warning("=== ЛИМИТ ШАГОВ ===")
+        BrowserManager().close()
+        return "Задача не завершена."
