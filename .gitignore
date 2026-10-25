@@ -1,0 +1,24 @@
+﻿# Chrome профиль агента (там куки и токены!)
+chrome_profile/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Логи и временные данные агента
+steps.jsonl
+history.jsonl
+errors/
+*.log
+workspace/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
