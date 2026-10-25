@@ -39,25 +39,30 @@ class BrowserAgent:
     def send(self, text: str):
         log.info(f"Отправляю промпт ({len(text)} символов)...")
         
-        # 1. Кликаем в поле ввода (ProseMirror)
+        # 1. Убеждаемся, что вкладка активна
+        self.page.bring_to_front()
+        
+        # 2. Ищем поле ввода и ЖДЕМ, пока оно станет видимым (до 15 секунд)
         input_box = self.page.locator('div[contenteditable="true"]').first
-        input_box.click()
-        time.sleep(0.2) # небольшая пауза для фокуса
+        try:
+            input_box.wait_for(state="visible", timeout=15000)
+        except Exception:
+            log.error("Поле ввода не появилось на экране за 15 секунд!")
+            raise
 
-        # 2. Очищаем поле (на всякий случай, если там остался старый текст)
+        # 3. Кликаем и вводим текст
+        input_box.click()
+        time.sleep(0.2)
         self.page.keyboard.press("Control+A")
         self.page.keyboard.press("Backspace")
         time.sleep(0.2)
-
-        # 3. Печатаем текст посимвольно (чтобы ProseMirror корректно обработал)
-        # Для длинных текстов это может быть медленно. Если нужно быстро — можно вставить через clipboard.
+        
         self.page.keyboard.insert_text(text)
-        time.sleep(0.5) # даем время на рендер текста в поле
-
-        # 4. Нажимаем Enter для отправки
+        time.sleep(0.5)
         self.page.keyboard.press("Enter")
         log.info("Промпт отправлен (нажат Enter).")
 
+        
     def wait_answer(self, timeout_sec=240, stable_sec=2.0):
         log.info("Жду ответа от ChatGPT...")
         start_time = time.time()
@@ -95,6 +100,12 @@ class BrowserAgent:
             time.sleep(0.3)
 
         raise TimeoutError(f"ChatGPT не ответил за {timeout_sec} секунд.")
+
+    def ask(self, prompt: str, timeout_sec=240) -> str:
+        """Удобная обертка: отправляет промпт и сразу ждет ответ."""
+        self.send(prompt)
+        return self.wait_answer(timeout_sec=timeout_sec)
+        
     def close(self):
         if self._pw:
             self._pw.stop()
