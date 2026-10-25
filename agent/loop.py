@@ -35,27 +35,45 @@ class AgentLoop:
     def _parse_json(self, text: str) -> dict:
         # 1. Ищем ```json ... ```
         match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-        if match: text = match.group(1)
+        if match:
+            text = match.group(1)
         else:
-            # 2. Ищем просто {...}
             start = text.find('{')
             end = text.rfind('}')
             if start != -1 and end != -1:
                 text = text[start:end+1]
         
+        # 2. Пытаемся распарсить как есть
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            # 3. Пытаемся экранировать все кавычки и распарсить
-            log.warning("Пытаюсь экранировать JSON...")
-            try:
-                # Находим content и экранируем внутренние кавычки
-                fixed = re.sub(r'(?<!\\)"', '\\"', text)
-                fixed = fixed.replace('\\"tool\\"', '"tool"').replace('\\"args\\"', '"args"')
-                return json.loads(fixed)
-            except Exception as e:
-                raise ValueError(f"Не удалось распарсить JSON: {e}\nТекст: {text}")
-
+            pass
+        
+        # 3. Умная починка: экранируем переносы строк внутри кавычек
+        try:
+            fixed_text = ""
+            in_string = False
+            escape_next = False
+            for char in text:
+                if char == '"' and not escape_next:
+                    in_string = not in_string
+                    fixed_text += char
+                elif char == '\\':
+                    escape_next = True
+                    fixed_text += char
+                elif char == '\n' and in_string:
+                    fixed_text += '\\n'
+                elif char == '\r' and in_string:
+                    fixed_text += '\\r'
+                else:
+                    escape_next = False
+                    fixed_text += char
+            
+            return json.loads(fixed_text)
+        except Exception as e:
+            log.error(f"Не удалось распарсить JSON: {e}")
+            return {"tool": "error", "args": {"message": "Невалидный JSON. Ответь ТОЛЬКО JSON."}}
+        
     def _switch_provider(self):
         if isinstance(self.provider, DeepSeekProvider):
             return False

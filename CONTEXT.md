@@ -1,3 +1,3 @@
 # Последняя выполненная задача
 
-Задача выполнена. Функция divide(a, b) в calculator.py возвращает 0 при делении на ноль, иначе a / b. Тесты в test_calculator.py проверяют обычное деление (10/2=5) и деление на ноль (10/0=0). pytest -q: 9 passed, exit_code=0.
+Файлы math_utils.py и test_math_utils.py созданы/перезаписаны. is_even(n) возвращает True для чётных чисел. pytest -q test_math_utils.py: 4 passed, exit_code=0.
