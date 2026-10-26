@@ -32,48 +32,29 @@ class AgentLoop:
         self.history = []
         self.last_action = None
 
-    def _parse_json(self, text: str) -> dict:
-        # 1. Ищем ```json ... ```
-        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-        if match:
-            text = match.group(1)
-        else:
-            start = text.find('{')
-            end = text.rfind('}')
-            if start != -1 and end != -1:
-                text = text[start:end+1]
-        
-        # 2. Пытаемся распарсить как есть
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-        
-        # 3. Умная починка: экранируем переносы строк внутри кавычек
-        try:
-            fixed_text = ""
-            in_string = False
-            escape_next = False
-            for char in text:
-                if char == '"' and not escape_next:
-                    in_string = not in_string
-                    fixed_text += char
-                elif char == '\\':
-                    escape_next = True
-                    fixed_text += char
-                elif char == '\n' and in_string:
-                    fixed_text += '\\n'
-                elif char == '\r' and in_string:
-                    fixed_text += '\\r'
-                else:
-                    escape_next = False
-                    fixed_text += char
+    def _parse_markdown(self, text: str) -> dict:
+        # 1. Ищем блок с кодом (```python ... ```)
+        code_match = re.search(r'```(?:python)?\s*(.*?)\s*```', text, re.DOTALL)
+        if code_match:
+            code = code_match.group(1)
+            # Ищем имя файла перед блоком (например, "Создаю файл calc.py")
+            file_match = re.search(r'Создаю файл\s+([\w\.]+)', text)
+            if not file_match:
+                file_match = re.search(r'файл\s+([\w\.]+)', text)
+            filename = file_match.group(1) if file_match else "main.py"
+            return {"tool": "write_file", "args": {"path": filename, "content": code}}
+
+        # 2. Ищем команду для запуска
+        cmd_match = re.search(r'Запускаю команду\s+(.+)', text)
+        if cmd_match:
+            return {"tool": "run", "args": {"cmd": cmd_match.group(1).strip()}}
+
+        # 3. Ищем завершение
+        if "Задача выполнена" in text:
+            return {"tool": "done", "args": {"summary": text.strip()}}
+
+        return {"tool": "error", "args": {"message": "Не понял команду. Напиши 'Создаю файл ...' или 'Запускаю команду ...'"}}
             
-            return json.loads(fixed_text)
-        except Exception as e:
-            log.error(f"Не удалось распарсить JSON: {e}")
-            return {"tool": "error", "args": {"message": "Невалидный JSON. Ответь ТОЛЬКО JSON."}}
-        
     def _switch_provider(self):
         if isinstance(self.provider, DeepSeekProvider):
             return False
@@ -91,8 +72,27 @@ class AgentLoop:
         
         past_context = memory.load_context()
         context_block = f"КОНТЕКСТ:\n{past_context}\n" if past_context else ""
+        
+        prompt = f"""Ты — автономный ИИ-агент. Ты управляешь файлами и командами.
 
-        prompt = f"{SYSTEM_PROMPT}\n\n{context_block}\nЗАДАЧА: {task}\n\nВызови первый инструмент."
+        ФОРМАТ ОТВЕТА:
+        1.Если нужно создать файл, напиши:
+        Создаю файл <имя_файла>
+        <КОД_ЗДЕСЬ>
+        2.Если нужно запустить тесты, напиши:
+        Запускаю команду <команда>
+        3.Если задача выполнена, напиши:
+        Задача выполнена. <итог>
+
+        ПРАВИЛА:
+        1.Пиши код в формате ```python (начни с трех обратных кавычек и слова python, закончи тремя обратными кавычками).
+        2.Используй только имена файлов (без путей).
+        3.Не пиши лишнего текста, только команды.
+        4.Сначала создай файлы, потом запускай тесты.
+
+        {context_block}
+        ЗАДАЧА: {task}
+        """
         self.history = [prompt]
 
         files_written = 0
@@ -108,14 +108,18 @@ class AgentLoop:
                 self.provider.send(f"Продолжаем (шаг {step}).")
 
             try:
-                self.provider.send("\n".join(self.history))
+                if step == 1:
+                    self.provider.send(prompt)
+                else:
+                    self.provider.send("\n".join(self.history))
+                
                 response_text = self.provider.wait_answer()
-                action = self._parse_json(response_text)
+                action = self._parse_markdown(response_text)
                 tool_name = action.get("tool")
                 args = action.get("args", {})
             except Exception as e:
                 log.error(f"Ошибка: {e}")
-                self.history.append(f"Ошибка: {e}. Ответь ТОЛЬКО JSON без Markdown.")
+                self.history.append(f"Ошибка: {e}.")
                 continue
 
             current_action_str = json.dumps(action, sort_keys=True)
@@ -129,13 +133,6 @@ class AgentLoop:
             log.info(f"Агент выбрал: {tool_name} {args}")
 
             if tool_name == "done":
-                if files_written == 0:
-                    self.history.append("Ты не создал файлов!")
-                    continue
-                if commands_run == 0:
-                    self.history.append("Ты не запустил тесты!")
-                    continue
-                
                 summary = args.get("summary", "Готово.")
                 log.info(f"=== ЗАВЕРШЕНО: {summary} ===")
                 memory.save_context(summary)
@@ -169,3 +166,5 @@ class AgentLoop:
         log.warning("=== ЛИМИТ ШАГОВ ===")
         BrowserManager().close()
         return "Задача не завершена."
+    
+      
